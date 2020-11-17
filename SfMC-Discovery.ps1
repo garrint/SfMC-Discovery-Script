@@ -28,10 +28,31 @@
 #>
 param(
     [Parameter(Mandatory=$true)] [string]$ExchangeServer,
+    [Parameter(Mandatory=$false)] [string]$UserName,
+    [Parameter(Mandatory=$false)] [string]$ServerName,
     [Parameter(Mandatory=$false)] [string]$DagName,
     [Parameter(Mandatory=$false)] [string]$OutputPath,
     [Parameter(Mandatory=$false)] [string]$ScriptPath
 )
+function Test-ADAuthentication {
+    $UserName = $creds.UserName
+    $UserName = $UserName.Substring(0, $UserName.IndexOf("@"))
+    $Password = $creds.GetNetworkCredential().Password
+    (New-Object DirectoryServices.DirectoryEntry "",$username,$password).PsBase.Name -ne $null
+}
+function Start-Cleanup {
+    Remove-PSSession -Name SfMC -ErrorAction Ignore
+    Remove-SmbShare -Name SfMCOutput$ -Force -Confirm:$False -ErrorAction Ignore
+    Remove-SmbShare -Name SfMCScript$ -Force -Confirm:$False -ErrorAction Ignore
+}
+function Get-FolderPath {   
+    $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+    $folderBrowser.Description = "Select the location"
+    $folderBrowser.SelectedPath = "C:\"
+    $folderPath = $folderBrowser.ShowDialog()
+    [string]$oPath = $folderBrowser.SelectedPath
+    return $oPath
+}
 function Zip-CsvResults {
 	#Change to the Script Location 
     Add-Type -AssemblyName System.IO.Compression.Filesystem 
@@ -51,12 +72,14 @@ function Is-Admin {
         return $false
     }
 }
-Clear-Host
+#Clear-Host
 if(-not (Is-Admin)) {
-	Write-host;Write-Warning "The SfMC-Exchange-Discovery-1.ps1 script needs to be executed in elevated mode. Please start PowerShell 'as Administrator' and try again." 
+	Write-host;Write-Warning "The SfMC-Exchange-Discovery.ps1 script needs to be executed in elevated mode. Please start PowerShell 'as Administrator' and try again." 
 	Write-host;Start-Sleep -Seconds 2;
 	exit
 }
+if(Get-SmbShare SfMCOutput$ -ErrorAction Ignore) {Remove-SmbShare -Name SfMCOutput$ -Confirm:$false }
+if(Get-SmbShare SfMCScript$ -ErrorAction Ignore) {Remove-SmbShare -Name SfMCScript$ -Confirm:$false }
 Write-host " "
     Write-host " "
     Write-host -ForegroundColor Cyan "==============================================================================="
@@ -80,71 +103,182 @@ Copy-Item -Path SfMC:\Get-ExchangeOrgDiscovery.ps1 -Destination "$env:ExchangeIn
 Set-Location $env:ExchangeInstallPath\Scripts
 .\Get-ExchangeOrgDiscovery.ps1 -Creds $param1 -destPath $param2 -sPath $param3
 }
-    ## Get the location for the scripts
-if($ScriptPath -like $null) {[string]$scriptPath = (Get-Location).Path}
-else{
-    if($ScriptPath.Substring($ScriptPath.Length-1,1) -eq "\") {$ScriptPath = $ScriptPath.Substring(0,$ScriptPath.Length-1)}
+## Get the location for the scripts
+Add-Type -AssemblyName System.Windows.Forms
+[boolean]$validPath = $false
+while($validPath -eq $false) {
+    if($ScriptPath -like $null) {[string]$scriptPath = (Get-Location).Path}
+    else{
+        if($ScriptPath.Substring($ScriptPath.Length-1,1) -eq "\") {$ScriptPath = $ScriptPath.Substring(0,$ScriptPath.Length-1)}
+    }
+    if(Test-Path -Path $ScriptPath) {$validPath = $true}
+    else {
+        Write-Warning "An invalid path to the scripts was provided. Please select the location."
+        Start-Sleep -Seconds 3
+        $ScriptPath = Get-FolderPath
+    }
 }
-## Convert the current location to a UNC path
-$ScriptPath = $ScriptPath.Replace(":","$")
-$ScriptPath = "\\$env:COMPUTERNAME\$ScriptPath"
 # Determine the current location which will be used to store the results
-if($OutputPath -like $null) {
-    Add-Type -AssemblyName System.Windows.Forms
-    Write-Host "Select the location where to save the data." -ForegroundColor Yellow
-    $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
-    $folderBrowser.Description = "Select the location where to save the data"
-    $folderBrowser.SelectedPath = "C:\"
-    $folderPath = $folderBrowser.ShowDialog()
-    [string]$OutputPath = $folderBrowser.SelectedPath
+[boolean]$validPath = $false
+while($validPath -eq $false) {
+    if($OutputPath -like $null) {
+        Write-Host "Select the location where to save the data." -ForegroundColor Yellow
+        $OutputPath = Get-FolderPath
+    }
+    else {
+        if($OutputPath.Substring($OutputPath.Length-1,1) -eq "\") {$OutputPath = $OutputPath.Substring(0,$OutputPath.Length-1)}
+    }
+    if(Test-Path -Path $OutputPath) {$validPath = $true}
+    else {
+        Write-Warning "An invalid path for the output was provided. Please select the location."
+        Start-Sleep -Seconds 3
+        $OutputPath = Get-FolderPath
+    }
 }
-else {
-    if($OutputPath.Substring($OutputPath.Length-1,1) -eq "\") {$OutputPath = $OutputPath.Substring(0,$OutputPath.Length-1)}
-}
-## Convert the current location to a UNC path
-$OutputPath = $OutputPath.Replace(":","$")
-$OutputPath = "\\$env:COMPUTERNAME\$OutputPath"
+$MonitorFolder = $OutputPath
+Write-Warning "Removing any existing results from $OutputPath."
+Start-Sleep -Seconds 2
+Get-ChildItem $OutputPath\*.zip | Remove-Item -Force
 ## Get the current user name and prompt for credentials
-$domain = $env:USERDNSDOMAIN
-$UserName = $env:USERNAME
-$upn = "$UserName@$domain"
-$c = [System.Management.Automation.PSCredential](Get-Credential -UserName $upn.ToLower() -Message "Exchange admin credentials")
+if($UserName -like $null) {
+    $domain = $env:USERDNSDOMAIN
+    $UserName = $env:USERNAME
+    $UserName = "$UserName@$domain"
+}
+$validCreds = $false
+[int]$credAttempt = 0
+while($validCreds -eq $false) {
+    $creds = [System.Management.Automation.PSCredential](Get-Credential -UserName $UserName.ToLower() -Message "Exchange admin credentials")
+    $validCreds =  Test-ADAuthentication -username $UserName -password $Password -root $Root
+    if($validCreds -eq $false) {
+        Write-Warning "Unable to validate your credentials. Please try again."
+        $credAttempt++
+    }
+    if($credAttempt -eq 3) {
+        Write-Warning "Too many credential failures. Exiting script."
+        exit
+    }
+}
+## Create temporary file shares to save the results
+try {New-SmbShare -Name SfMCOutput$ -Path $OutputPath -FullAccess $creds.UserName -Description "Temporary share for SfMC Discovery" -ErrorAction Stop | Out-Null}
+catch {
+    Write-Warning "Unable to create the SfMCOutput share. Exiting script"
+    exit
+}
+try {New-SmbShare -Name SfMCScript$ -Path $ScriptPath -FullAccess $creds.UserName -Description "Temporary share for SfMC Discovery" -ErrorAction Stop | Out-Null}
+catch {
+    Write-Warning "Unable to create the SfMCScript share. Exiting script"
+    exit
+}
+## Update variable values with the new share values
+$OutputPath = "\\$env:COMPUTERNAME\SfMCOutput$"
+$ScriptPath = "\\$env:COMPUTERNAME\SfMCScript$"
+## Create an array for the list of Exchange servers
 $servers = New-Object System.Collections.ArrayList
 ## Set a timer
 $stopWatch = New-Object -TypeName System.Diagnostics.Stopwatch
 $stopWatch.Start()
 ## Connect to the Exchange server to get a list of servers for data collection
-Import-PSSession (New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri http://$ExchangeServer/Powershell -AllowRedirection -Authentication Kerberos -Name SfMC -WarningAction Ignore -Credential $c) -WarningAction Ignore -DisableNameChecking -AllowClobber | Out-Null
-if($DagName.Length -gt 0) { $servers = Get-DatabaseAvailabilityGroup $DagName | Select -ExpandProperty Servers }
-else {Get-ExchangeServer | Where { $_.ServerRole -ne "Edge"} | ForEach-Object { $servers.Add($_.Fqdn) | Out-Null }
+$isConnected = $false
+[int]$retryAttempt = 0
+while($isConnected -eq $false) {
+    $Error.Clear()
+    try {Import-PSSession (New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri http://$ExchangeServer/Powershell -AllowRedirection -Authentication Kerberos -Name SfMC -WarningAction Ignore -Credential $creds -ErrorAction Ignore) -WarningAction Ignore -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null}
+    catch {
+        Write-Warning "Unable to create a remote PowerShell session with $ExchangeServer."
+        Start-Sleep -Seconds 2
+        $ExchangeServer = Read-Host "Please enter the FQDN of another Exchange Server: "
+    }
+    $Error.Clear()
+    try{$testServer = Get-ExchangeServer $ExchangeServer -ErrorAction Ignore}
+    catch{$retryAttempt++}
+    if($testServer -like $null) {
+        if($retryAttempt -eq 4) {
+            Write-Warning "Maximum number of attempts has been reached. Check credentials and try again. Exiting script."
+            exit
+        }
+    }
+    else{$isConnected = $true}
+}
+if($ServerName -notlike $null) {
+    $CheckServer = (Get-ExchangeServer -Identity $ServerName -ErrorAction Ignore).Fqdn
+    if($CheckServer -notlike $null) {
+        $servers.Add($CheckServer) | Out-Null
+    }
+    else {
+        Write-Warning "Unable to find an Exchange server with the name $ServerName. Exiting script"
+        Start-Cleanup
+        exit
+    }
+}
+else {
+    if($DagName -notlike $null) { 
+        Get-DatabaseAvailabilityGroup $DagName -ErrorAction Ignore | Select -ExpandProperty Servers | ForEach-Object { $servers.Add((Get-ExchangeServer $_ ).Fqdn) | Out-Null}
+        if($servers.Count -eq 0){
+            Write-Warning "Unable to find a database availability group with the name $DagName. Exiting script"
+            Start-Cleanup
+            exit
+        }
+    }
+    else {Get-ExchangeServer | Where { $_.ServerRole -ne "Edge"} | ForEach-Object { $servers.Add($_.Fqdn) | Out-Null } }
 }
 Write-host -ForegroundColor Yellow "Collecting data now, please be patient. This will take some time to complete!"
 Write-Host -ForegroundColor Yellow "Collecting Exchange organization settings..." -NoNewline
 ## Collect Exchange organization settings
-Invoke-Command -ScriptBlock $scriptBlock2 -ComputerName $ExchangeServer -ArgumentList $c, $OutputPath, $ScriptPath -InDisconnectedSession -Credential $c | Out-Null
+$Error.Clear()
+try {Invoke-Command -Credential $creds -ScriptBlock $scriptBlock2 -ComputerName $ExchangeServer -ArgumentList $creds, $OutputPath, $ScriptPath -InDisconnectedSession -ErrorAction Stop | Out-Null}
+catch {
+    Write-Host "FAILED"
+    Write-Warning "Unable to collect Exchange organization settings."
+}
 Write-Host "COMPLETE"
 Write-Host "Starting data collection on the Exchange servers..." -ForegroundColor Yellow 
 ## Collect server specific data from all the servers
-Invoke-Command -ScriptBlock $scriptBlock1 -ComputerName $servers -ArgumentList $c, $OutputPath, $ScriptPath -InDisconnectedSession -Credential $c | Out-Null
+$failedServers = New-Object System.Collections.ArrayList
+foreach($s in $servers) {
+    $Error.Clear()
+    Write-Host "Attempt to collect data from $s..." -ForegroundColor Cyan
+    try{Invoke-Command -Credential $creds -ScriptBlock $scriptBlock1 -ComputerName $s -ArgumentList $creds, $OutputPath, $ScriptPath -InDisconnectedSession -ErrorAction Stop | Out-Null}
+    catch{
+        Write-Warning "Unable to connect to $s to collect data."
+        $failedServers.Add($s) | Out-Null
+    }
+}
+if($failedServers.Count -gt 0) {
+    foreach($f in $failedServers) {
+        $servers.Remove($f) | Out-Null
+    }
+}
 $AllResultsUploaded = $false
+$monitorWatch = New-Object -TypeName System.Diagnostics.Stopwatch
+$monitorWatch.Start()
 while($AllResultsUploaded -eq $false) {
-    Get-ChildItem "$OutputPath\*.zip" | Select Name | ForEach-Object {
+    Get-ChildItem "$MonitorFolder\*.zip" -ErrorAction Ignore| Select Name | ForEach-Object {
         foreach($s in $servers) {
             [string]$server = $s.Substring(0, $s.IndexOf("."))
             if($_.Name -like "$server*") {
-                Write-Host "Results for $s have been received." -ForegroundColor Cyan
+                Write-Host "Results for $s have been received." -ForegroundColor Green
                 $servers.Remove($s) | Out-Null
                 break
+                $monitorWatch.Restart()
             }
         }
         if($servers.Count -eq 0) {$AllResultsUploaded = $true}
     }
+    if($monitorWatch.Elapsed.TotalMinutes -ge 5) {
+               Write-Warning "Delay detected in receiving results."
+                $AllResultsUploaded = $true
+                [int]$EarlyExit = 1
+    }
 }
-Write-Host "All results have been received." -ForegroundColor Yellow
+if($EarlyExit -eq 1) {Write-Host "Not all results have been received." -ForegroundColor Yellow}
+else{Write-Host "All results have been received." -ForegroundColor Yellow}
 Write-Host " "
 Write-Host " "
 $stopWatch.Stop()
 $totalTime = $stopWatch.Elapsed.TotalSeconds
+$timeStamp = Get-Date -Format yyyyMMddHHmmss
+Compress-Archive -Path $MonitorFolder -DestinationPath ".\DiscoveryResults-$timeStamp.zip"
 Write-host " "
 Write-host -ForegroundColor Cyan  "==================================================="
 Write-Host -ForegroundColor Cyan " SfMC Email Discovery data collection has finished!"
@@ -152,4 +286,4 @@ Write-Host -ForegroundColor Cyan "          Total collection time: $($totalTime)
 Write-Host -ForegroundColor Cyan "    Please upload results to SfMC. - Thank you!!!"
 Write-host -ForegroundColor Cyan "==================================================="
 Write-host " "
-Remove-PSSession -Name SfMC
+Start-Cleanup
